@@ -645,12 +645,12 @@ class C3TR(C3):
 
 class MaskedC3TR(nn.Module):
     # C3 module with TransformerBlock()
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, use_lora=False, lora_config=None):
         super(MaskedC3TR, self).__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_)
-        self.cv2 = Conv(c1, c_)
-        self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
+        self.cv1 = Conv(c1, c_, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = Conv(c1, c_, use_lora=use_lora, lora_config=lora_config)
+        self.cv3 = Conv(2 * c_, c2, 1, use_lora=use_lora, lora_config=lora_config)  # act=FReLU(c2)
         self.m = MaskedTransformerBlock(c_, c_, 4, n)
 
     def forward(self, x):
@@ -662,15 +662,15 @@ class MaskedC3TR(nn.Module):
 class C2f(nn.Module):
     """Faster Implementation of CSP Bottleneck with 2 convolutions."""
 
-    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5):
+    def __init__(self, c1, c2, n=1, shortcut=False, g=1, e=0.5, use_lora=False, lora_config=None):
         """Initialize CSP bottleneck layer with two convolutions with arguments ch_in, ch_out, number, shortcut, groups,
         expansion.
         """
         super().__init__()
         self.c = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
-        self.cv2 = Conv((2 + n) * self.c, c2, 1)  # optional act=FReLU(c2)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0) for _ in range(n))
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = Conv((2 + n) * self.c, c2, 1, use_lora=use_lora, lora_config=lora_config)  # optional act=FReLU(c2)
+        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, g, k=((3, 3), (3, 3)), e=1.0, use_lora=use_lora, lora_config=lora_config) for _ in range(n))
 
     def forward(self, x):
         """Forward pass through C2f layer."""
@@ -764,12 +764,12 @@ class SPPF(nn.Module):
 
 class ASPP(nn.Module):
     # Atrous spatial pyramid pooling layer
-    def __init__(self, c1, c2, d=(1, 2, 4, 6)):
+    def __init__(self, c1, c2, d=(1, 2, 4, 6), use_lora=False, lora_config=None):
         super(ASPP, self).__init__()
         assert c1 == c2 and c2 % len(d) == 0
         c_ = c2 // len(d)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.m = nn.ModuleList([Conv(c_, c_, k=3, s=1, p=x, d=x) for x in d])
+        self.cv1 = Conv(c1, c_, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.m = nn.ModuleList([Conv(c_, c_, k=3, s=1, p=x, d=x, use_lora=use_lora, lora_config=lora_config) for x in d])
 
     def forward(self, x):
         x = self.cv1(x)
@@ -778,9 +778,9 @@ class ASPP(nn.Module):
 
 class Focus(nn.Module):
     # Focus wh information into c-space
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, use_lora=False, lora_config=None):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Focus, self).__init__()
-        self.conv = Conv(c1 * 4, c2, k, s, p, g, act)
+        self.conv = Conv(c1 * 4, c2, k, s, p, g, act, use_lora=use_lora, lora_config=lora_config)
         # self.contract = Contract(gain=2)
 
     def forward(self, x):  # x(b,c,w,h) -> y(b,4c,w/2,h/2)
@@ -790,9 +790,9 @@ class Focus(nn.Module):
 
 class Blur(nn.Module):
     # Blur c information into wh-space
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):  # ch_in, ch_out, kernel, stride, padding, groups
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True, use_lora=False, lora_config=None):  # ch_in, ch_out, kernel, stride, padding, groups
         super(Blur, self).__init__()
-        self.conv = Conv(c1 // 4, c2, k, s, p, g, act)
+        self.conv = Conv(c1 // 4, c2, k, s, p, g, act, use_lora=use_lora, lora_config=lora_config)
 
     def forward(self, x):  # x(b,4c,w,h) -> y(b,c,2w,2h)
         return self.conv(F.pixel_shuffle(x, 2))
