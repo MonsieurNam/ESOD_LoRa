@@ -569,11 +569,13 @@ class Model(nn.Module):
         model_info(self, verbose, img_size)
 
 
+# Dán toàn bộ hàm này để thay thế hàm parse_model hiện tại trong models/yolo.py
+
 def parse_model(d, ch):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
-    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors
-    no = na * (nc + 5)
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
 
     lora_config = d.get('lora_config', None)
     use_lora = lora_config is not None
@@ -584,54 +586,63 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         lora_config.setdefault('merge_weights', False)
         logger.info(colorstr('LoRA: ') + 'enabled with config: %s' % lora_config)
 
-    layers, save, c2 = [], [], ch[-1]
-    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):
-        m = eval(m) if isinstance(m, str) else m
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             try:
-                args[j] = eval(a) if isinstance(a, str) else a
+                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
             except:
                 pass
 
-        n = max(round(n * gd), 1) if n > 1 else n
+        n = max(round(n * gd), 1) if n > 1 else n  # depth gain
 
-        # === BẮT ĐẦU SỬA ĐỔI CHÍNH ===
-        # Danh sách các mô-đun tổ hợp cần truyền tham số LoRA xuống
+        # === LOGIC SỬA LỖI TRỌNG TÂM ===
+        # Xác định kênh đầu vào c1 một cách an toàn
+        if isinstance(f, int):
+            c1 = ch[f]
+        else: # f là một danh sách
+            # Với Concat, c1 là tổng các kênh. Với các lớp khác, c1 là kênh của lớp đầu tiên trong danh sách f.
+            if m is Concat:
+                c1 = sum(ch[x] for x in f)
+            else:
+                c1 = ch[f[0]] # Lấy kênh từ nhánh chính (nhánh đầu tiên)
+
+        # Xác định các mô-đun sẽ được áp dụng LoRA
         lora_propagating_modules = [Bottleneck, BottleneckCSP, C3, C3TR, SPP, SPPF]
-        
-        # Danh sách các mô-đun tích chập cơ bản
         base_conv_modules = [Conv, DWConv, GhostConv, DCN, RepLKConv, MixConv2d, Focus, CrossConv]
-
+        
         lora_kwargs = {}
-        if use_lora:
-            # Nếu mô-đun là một trong các loại này, chúng ta sẽ truyền cờ LoRA vào nó
-            if m in base_conv_modules or m in lora_propagating_modules:
-                 lora_kwargs = {'use_lora': True, 'lora_config': lora_config}
+        if use_lora and (m in base_conv_modules or m in lora_propagating_modules):
+            lora_kwargs = {'use_lora': True, 'lora_config': lora_config}
 
-        # Logic xác định kênh đầu vào c1 và đầu ra c2
+        # Logic xác định args và kênh đầu ra c2
         if m in base_conv_modules or m in lora_propagating_modules:
-            c1 = ch[f] if isinstance(f, int) else sum(ch[x] for x in f) # Xử lý f là list cho Concat
             c2 = args[0]
-            if c2 != no:  # if not output
+            if c2 != no:
                 c2 = make_divisible(c2 * gw, 8)
             
             args = [c1, c2, *args[1:]]
             
             if m in [BottleneckCSP, C3, C3TR]:
-                args.insert(2, n)  # number of repeats
+                args.insert(2, n)
                 n = 1
         elif m is nn.BatchNorm2d:
-            args = [ch[f]]
+            args = [c1]
+            c2 = c1
         elif m is Concat:
-            c2 = sum(ch[x] for x in f)
+            c2 = c1
         elif m in [Detect, Segmenter, Center]:
+            # args đã chứa nc, anchors. Cần thêm ch.
             args.append([ch[x] for x in f])
-        # Thêm các lớp khác không phải là lớp tích chập ở đây
-        elif m in [HeatMapParser, Indexer, Token2Image, nn.Upsample]:
-            c2 = ch[f] # Kênh đầu ra thường bằng kênh đầu vào
-        else:
-            c2 = ch[f]
-        # === KẾT THÚC SỬA ĐỔI CHÍNH ===
+            c2 = 0 # Lớp Detect không có đầu ra kênh duy nhất
+        elif m is HeatMapParser:
+            # HeatMapParser có thể thay đổi số kênh. c2 được xác định trong args.
+            c2 = args[0]
+            args = [c1, *args] # Truyền c1 vào, mặc dù HeatMapParser có thể không dùng
+        else: # Các lớp khác như Indexer, Upsample, v.v.
+            c2 = c1
+        # === KẾT THÚC LOGIC SỬA LỖI ===
 
         m_ = nn.Sequential(*[m(*args, **lora_kwargs) for _ in range(n)]) if n > 1 else m(*args, **lora_kwargs)
         
@@ -639,7 +650,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         np = sum([x.numel() for x in m_.parameters()])
         m_.i, m_.f, m_.type, m_.np = i, f, t, np
         logger.info('%3s%18s%3s%10.0f  %-40s%-30s' % (i, f, n, np, t, args))
-        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x not in [-1]) # Sửa lại điều kiện
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)
         layers.append(m_)
         if i == 0:
             ch = []
