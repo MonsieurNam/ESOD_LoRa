@@ -37,6 +37,8 @@ from utils.loss import ComputeLoss
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution, plot_cluster
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, de_parallel, time_synchronized
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
+from loralib.utils import mark_only_lora_as_trainable
+from utils.general import colorstr
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +64,8 @@ def train(hyp, opt, device, tb_writer=None):
         os.mkdir(save_dir / 'scripts')
         for file in ['train.py', 'test.py', 'utils/loss.py', 'utils/general.py', 'utils/datasets.py', 
                      'models/yolo.py', 'models/common.py', opt.cfg]:
-            shutil.copyfile(file, save_dir / 'scripts' / os.path.basename(file))
+            if os.path.exists(file):
+                shutil.copyfile(file, save_dir / 'scripts' / os.path.basename(file))
 
     # Configure
     plots = not opt.evolve  # create plots
@@ -84,8 +87,31 @@ def train(hyp, opt, device, tb_writer=None):
 
     nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
     names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
-    assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
-    is_coco = opt.data.endswith('coco.yaml') and nc == 80  # COCO dataset
+    assert len(names) == nc, f'{len(names)} names found for nc={nc} dataset in {opt.data}'
+    is_coco = opt.data.endswith('coco.yaml') and nc == 80
+
+    # >>>>>>>>>>>>>>>> BƯỚC 2: CẬP NHẬT CẤU HÌNH MÔ HÌNH VỚI CÁC ĐỐI SỐ LORA <<<<<<<<<<<<<<<<
+    # Tải cấu hình mô hình từ tệp .yaml gốc
+    with open(opt.cfg) as f:
+        model_dict = yaml.safe_load(f)
+    
+    # Nếu cờ --use-lora được bật, tự động chèn lora_config vào từ điển
+    if opt.use_lora:
+        model_dict['lora_config'] = {
+            'r': opt.lora_rank,
+            'alpha': opt.lora_alpha,
+            'lora_dropout': opt.lora_dropout,
+            'merge_weights': False  # Luôn là False khi huấn luyện
+        }
+        logger.info(colorstr('bold, green', 'LoRA Enabled: ') + 
+                    f"rank={opt.lora_rank}, alpha={opt.lora_alpha}, dropout={opt.lora_dropout}")
+    else:
+        # Đảm bảo không có lora_config nếu cờ không được bật
+        if 'lora_config' in model_dict:
+            del model_dict['lora_config']
+            
+    cfg_for_model = model_dict
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Model
     pretrained = weights.endswith('.pt')
@@ -93,60 +119,88 @@ def train(hyp, opt, device, tb_writer=None):
         with torch_distributed_zero_first(rank):
             weights = attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume and not opt.freeze else []  # exclude keys
-        state_dict = ckpt['model'].float().state_dict()  # to FP32
-        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude, cfg_path=opt.cfg)  # intersect
-        model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+        # Sử dụng cfg_for_model đã được cập nhật thay vì opt.cfg
+        model = Model(cfg_for_model, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume and not opt.freeze else []
+        state_dict = ckpt['model'].float().state_dict()
+        
+        # Tải trọng số với strict=False. Các trọng số gốc sẽ được tải, 
+        # trong khi các tham số mới của LoRA (lora_A, lora_B) sẽ bị bỏ qua và giữ nguyên giá trị khởi tạo.
+        model.load_state_dict(state_dict, strict=False)
+        loaded_keys = [k for k in state_dict if k in model.state_dict()]
+        logger.info(f'Transferred {len(loaded_keys)}/{len(model.state_dict())} items from {weights}')
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        # Sử dụng cfg_for_model đã được cập nhật khi tạo mô hình từ đầu
+        model = Model(cfg_for_model, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+        
     with torch_distributed_zero_first(rank):
-        check_dataset(data_dict)  # check
+        check_dataset(data_dict)
     train_path = data_dict['train']
     test_path = data_dict['val']
 
-    # Freeze
-    freeze = []  # parameter names to freeze (full or partial)
-    unfreeze = []
-    if opt.freeze:
-        raise NotImplementedError('Navigate to here to manually set the layers to freeze and uncomment this error.')
-        hyp['weight_decay'] = 0.
-        # freeze = ['model.{}.'.format(ii) for ii in range(8)]
-        # print('freeze', freeze)
-        unfreeze = ['model.5', 'model.6'] # DWConv and Segmenter
-        print('unfreeze', unfreeze)
-    for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
-        if any(x in k for x in freeze) or (len(unfreeze) and all(x not in k for x in unfreeze)):
-            # print('freezing %s' % k)
-            v.requires_grad = False
+    # >>>>>>>>>>>>>>>> BƯỚC 3 (Phần 1): ĐÓNG BĂNG CÁC TRỌNG SỐ KHÔNG PHẢI LORA <<<<<<<<<<<<<<<<
+    if opt.use_lora:
+        # Đóng băng tất cả các tham số ngoại trừ LoRA.
+        # 'bias=none' có nghĩa là bias của các lớp gốc cũng bị đóng băng.
+        mark_only_lora_as_trainable(model, bias='none')
+        logger.info(colorstr('bold, green', 'LoRA: ') + 'Froze base model weights.')
+        
+        # (Tùy chọn nhưng khuyến nghị) Mở đóng băng cho lớp đầu ra (detection head).
+        # Điều này giúp mô hình thích ứng tốt hơn với tác vụ mới.
+        try:
+            for name, param in model.model[-1].named_parameters():
+                 param.requires_grad = True
+            logger.info(colorstr('bold, green', 'LoRA: ') + 'Unfroze the final detection head for better adaptation.')
+        except Exception as e:
+            logger.warning(colorstr('yellow', 'LoRA Warning: ') + f'Could not unfreeze detection head: {e}')
+    else:
+        # Logic đóng băng gốc của ESOD (nếu có)
+        freeze = []
+        if opt.freeze:
+            raise NotImplementedError('Navigate to here to manually set the layers to freeze and uncomment this error.')
+        for k, v in model.named_parameters():
+            v.requires_grad = True
+            if any(x in k for x in freeze):
+                v.requires_grad = False
+    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
     # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
+    nbs = 64
+    accumulate = max(round(nbs / total_batch_size), 1)
+    hyp['weight_decay'] *= total_batch_size * accumulate / nbs
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
-    pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-    for k, v in model.named_modules():
-        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter) and (v.bias.requires_grad or True):
-            pg2.append(v.bias)  # biases
-        if (isinstance(v, nn.BatchNorm2d) or isinstance(v, nn.LayerNorm)) and (v.weight.requires_grad or True):
-            pg0.append(v.weight)  # no decay
-        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter) and (v.weight.requires_grad or True):
-            pg1.append(v.weight)  # apply decay
-
-    if opt.adam:
-        # optimizer = optim.AdamW(pg0, lr=hyp['lr0'] * 0.02)  # adjust beta1 to momentum
-        optimizer = optim.AdamW(pg0, lr=hyp['lr0'] * 0.1, betas=(hyp['momentum'], 0.999))  # adjust beta1 to momentum
+    # >>>>>>>>>>>>>>>> BƯỚC 3 (Phần 2): CẤU HÌNH OPTIMIZER CHO LORA <<<<<<<<<<<<<<<<
+    if opt.use_lora:
+        # Nếu dùng LoRA, chỉ cần tạo optimizer cho các tham số có requires_grad=True
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        num_trainable = sum(p.numel() for p in trainable_params)
+        logger.info(colorstr('bold, green', 'LoRA: ') + 
+                    f"Creating optimizer for {len(trainable_params)} parameter groups "
+                    f"with {num_trainable/1e6:.3f}M trainable parameters.")
+        
+        # Sử dụng AdamW là lựa chọn tốt cho việc fine-tuning
+        optimizer = optim.AdamW(trainable_params, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999), weight_decay=hyp['weight_decay'])
     else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
-
-    optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
-    optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
-    logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
-    del pg0, pg1, pg2
+        # Logic optimizer gốc của ESOD
+        pg0, pg1, pg2 = [], [], []
+        for k, v in model.named_modules():
+            if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+                pg2.append(v.bias)
+            if isinstance(v, (nn.BatchNorm2d, nn.LayerNorm)):
+                pg0.append(v.weight)
+            elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
+                pg1.append(v.weight)
+        
+        if opt.adam:
+            optimizer = optim.AdamW(pg0, lr=hyp['lr0'], betas=(hyp['momentum'], 0.999))
+        else:
+            optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+            
+        optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})
+        optimizer.add_param_group({'params': pg2})
+        logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
+        del pg0, pg1, pg2
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
     # https://pytorch.org/docs/stable/_modules/torch/optim/lr_scheduler.html#OneCycleLR
@@ -536,6 +590,11 @@ if __name__ == '__main__':
     parser.add_argument('--hm-only', action='store_true', help='training on heatmap prediction only')
     parser.add_argument('--hm-metric', action='store_true', help='use heatmap-related evaluation metrics')
     parser.add_argument('--disable-half', action='store_true', help='disable FP16 half-precision training')
+    
+    parser.add_argument('--use-lora', action='store_true', help='Enable LoRA for parameter-efficient fine-tuning.')
+    parser.add_argument('--lora-rank', type=int, default=4, help='The rank (r) of the low-rank matrices in LoRA.')
+    parser.add_argument('--lora-alpha', type=int, default=8, help='The alpha scaling factor for LoRA.')
+    parser.add_argument('--lora-dropout', type=float, default=0.1, help='Dropout probability for LoRA layers.')
     opt = parser.parse_args()
 
     # Set DDP variables
