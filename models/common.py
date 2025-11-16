@@ -590,12 +590,12 @@ class HeatMapParser(nn.Module):
 
     
 class Bottleneck(nn.Module):
-    # Standard bottleneck
-    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
+    # Standard bottleneck, now LoRA-aware
+    def __init__(self, c1, c2, shortcut=True, g=1, e=0.5, use_lora=False, lora_config=None):
         super(Bottleneck, self).__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cv1 = Conv(c1, c_, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = Conv(c_, c2, 3, 1, g=g, use_lora=use_lora, lora_config=lora_config)
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
@@ -604,16 +604,16 @@ class Bottleneck(nn.Module):
 
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5, use_lora=False, lora_config=None):
         super(BottleneckCSP, self).__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False)
-        self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False)
-        self.cv4 = Conv(2 * c_, c2, 1, 1)
-        self.bn = nn.BatchNorm2d(2 * c_)  # applied to cat(cv2, cv3)
+        self.cv1 = Conv(c1, c_, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = nn.Conv2d(c1, c_, 1, 1, bias=False) # Lớp này không phải là lớp Conv tùy chỉnh của chúng ta, nên không thêm LoRA
+        self.cv3 = nn.Conv2d(c_, c_, 1, 1, bias=False) # Tương tự
+        self.cv4 = Conv(2 * c_, c2, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.bn = nn.BatchNorm2d(2 * c_)
         self.act = nn.LeakyReLU(0.1, inplace=True)
-        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
+        self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0, use_lora=use_lora, lora_config=lora_config) for _ in range(n)])
 
     def forward(self, x):
         y1 = self.cv3(self.m(self.cv1(x)))
@@ -630,7 +630,6 @@ class C3(nn.Module):
         self.cv2 = Conv(c1, c_, 1, 1)
         self.cv3 = Conv(2 * c_, c2, 1)  # act=FReLU(c2)
         self.m = nn.Sequential(*[Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)])
-        # self.m = nn.Sequential(*[CrossConv(c_, c_, 3, 1, g, 1.0, shortcut) for _ in range(n)])
 
     def forward(self, x):
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), dim=1))
@@ -735,11 +734,11 @@ class CBAM(nn.Module):
 
 class SPP(nn.Module):
     # Spatial pyramid pooling layer used in YOLOv3-SPP
-    def __init__(self, c1, c2, k=(5, 9, 13)):
+    def __init__(self, c1, c2, k=(5, 9, 13), use_lora=False, lora_config=None):
         super(SPP, self).__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = Conv(c_ * (len(k) + 1), c2, 1, 1, use_lora=use_lora, lora_config=lora_config)
         self.m = nn.ModuleList([nn.MaxPool2d(kernel_size=x, stride=1, padding=x // 2) for x in k])
 
     def forward(self, x):
@@ -748,18 +747,12 @@ class SPP(nn.Module):
 
 
 class SPPF(nn.Module):
-    """Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher."""
-
-    def __init__(self, c1, c2, k=5):
-        """
-        Initializes the SPPF layer with given input/output channels and kernel size.
-
-        This module is equivalent to SPP(k=(5, 9, 13)).
-        """
+    # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher.
+    def __init__(self, c1, c2, k=5, use_lora=False, lora_config=None):
         super().__init__()
         c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
+        self.cv1 = Conv(c1, c_, 1, 1, use_lora=use_lora, lora_config=lora_config)
+        self.cv2 = Conv(c_ * 4, c2, 1, 1, use_lora=use_lora, lora_config=lora_config)
         self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
 
     def forward(self, x):
