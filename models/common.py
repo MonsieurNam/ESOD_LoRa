@@ -48,7 +48,7 @@ class Conv(nn.Module):
             self.conv = lora.Conv2d(
                 c1, c2, k, 
                 r=lora_config['r'], 
-                lora_alpha=lora_config['alpha'],
+                lora_alpha=lora_config['lora_alpha'],
                 lora_dropout=lora_config['lora_dropout'],
                 merge_weights=lora_config['merge_weights'],
                 stride=s, 
